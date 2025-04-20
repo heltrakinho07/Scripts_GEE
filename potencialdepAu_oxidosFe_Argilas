@@ -1,0 +1,122 @@
+// 1. Definir o distrito de Manica, província da Manica, Moçambique
+var distrito = ee.FeatureCollection("projects/eengine-project/assets/gadm41_MOZ_3")
+  .filter(ee.Filter.eq('NAME_2', 'Manica'));
+
+var distritoEstilo = distrito.style({
+  color: 'red',
+  fillColor: '00000000',  // 100% transparente
+  width: 2                // largura do contorno
+});
+
+
+// 2. Carregar dados do Sentinel-2 (refletância de superfície)
+var bandasOxidos = ["B2", 'B3', 'B4', 'B11', "B8", 'B12'];
+var sentinel2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(distrito)
+  .filterDate('2024-01-01', '2025-04-18')
+  .select(bandasOxidos)
+  .median()
+  .clip(distrito);
+
+
+// 3. Remover vegetação com NDVI
+var ndvi = sentinel2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var semVegetacao = sentinel2.updateMask(ndvi.lt(0.3)); // Máscara: vegetação baixa
+
+// 4. Índice de Óxidos de Ferro: B4 (vermelho) / B2 (azul)
+var oxidoFerro = semVegetacao.normalizedDifference(['B4', 'B2']).rename('OxidoFerro');
+
+// 5. Índice de Minerais Argilosos: B11 (SWIR) / B8 (NIR)
+var mineraisArgilosos = semVegetacao.normalizedDifference(['B11', 'B8']).rename('MineraisArgilosos');
+
+
+// 6. Combinar os índices: valores elevados em ambos os índices
+var combined = oxidoFerro.multiply(mineraisArgilosos).rename('Combined_Index');
+
+
+// 7. Histogramas para análise da distribuição
+print(ui.Chart.image.histogram(oxidoFerro, distrito, 100).setOptions({title: 'Histograma - Óxidos de Ferro'}));
+print(ui.Chart.image.histogram(mineraisArgilosos, distrito, 100).setOptions({title: 'Histograma - Minerais Argilosos'}));
+
+
+// 8. Calcular e imprimir a média dos valores de óxidos de ferro na área de estudo
+var meanCanopyHeight = oxidoFerro.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Média de Óxidos de Ferro:', meanCanopyHeight);
+
+// 9. Calcular e imprimir o valor máximo de óxidos de ferro na área de estudo
+var maxCanopyHeight = oxidoFerro.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Máximo de Óxidos de Ferro:', maxCanopyHeight);
+
+// 10. Calcular e imprimir o valor mínimo de óxidos de ferro na área de estudo
+var minCanopyHeight = oxidoFerro.reduceRegion({
+  reducer: ee.Reducer.min(),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Mínimo de Óxidos de Ferro:', minCanopyHeight);
+
+//11. Calcular e imprimir o percentil 99 dos óxidos de ferro na área de estudo
+var canopyHeight99thPercentile = oxidoFerro.reduceRegion({
+  reducer: ee.Reducer.percentile([99]),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Percentil 99 de Óxidos de Ferro:', canopyHeight99thPercentile);
+
+// ----------------------------
+
+// 12. Calcular e imprimir a média dos minerais argilosos na área de estudo
+var meanCanopyHeight = mineraisArgilosos.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Média de Minerais Argilosos:', meanCanopyHeight);
+
+// 13. Calcular e imprimir o valor máximo de minerais argilosos na área de estudo
+var maxCanopyHeight = mineraisArgilosos.reduceRegion({
+  reducer: ee.Reducer.max(),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Máximo de Minerais Argilosos:', maxCanopyHeight);
+
+// 14. Calcular e imprimir o valor mínimo de minerais argilosos na área de estudo
+var minCanopyHeight = mineraisArgilosos.reduceRegion({
+  reducer: ee.Reducer.min(),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Mínimo de Minerais Argilosos:', minCanopyHeight);
+
+// 15. Calcular e imprimir o percentil 99 dos minerais argilosos na área de estudo
+var canopyHeight99thPercentile = mineraisArgilosos.reduceRegion({
+  reducer: ee.Reducer.percentile([99]),
+  geometry: distrito,
+  scale: 100
+}).values().get(0);
+print('Percentil 99 de Minerais Argilosos:', canopyHeight99thPercentile);
+
+
+
+
+// 16 Visualizar o mapa de calor com uma paleta forte
+Map.addLayer(combined, 
+  {min: 0.0, max: 0.3, palette: ['white', 'yellow', 'orange', 'red']}, 
+  'Mapa de Calor (Altos valores em ambos os índices)'
+);
+
+// 17 Visualizar os índices com paletas otimizadas
+Map.addLayer(distrito, {}, 'Distrito de Alto Molocue');
+Map.centerObject(distrito, 9);
+Map.addLayer(oxidoFerro, {min: -0.5, max: 0.5, palette: ['blue', 'white', 'darkred']}, 'Óxidos de Ferro (Potencial Indicador de Ouro)');
+Map.addLayer(mineraisArgilosos, {min: -0.5, max: 0.5, palette: ['purple', 'white', 'green']}, 'Minerais Argilosos (Potencial Indicador de Ouro)');
+
