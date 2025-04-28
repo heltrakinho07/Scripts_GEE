@@ -1,0 +1,251 @@
+// Modelagem da Perda de Solo usando RUSLE no Google Earth Engine
+
+
+// 1. IMPORTAR CONJUNTOS DE DADOS NECESSÁRIOS
+// CHIRPS: dados de precipitação
+var CHIRPS = ee.ImageCollection("UCSB-CHG/CHIRPS/PENTAD");
+// Solo: dados de textura do solo
+var soil = ee.Image("OpenLandMap/SOL/SOL_TEXTURE-CLASS_USDA-TT_M/v02");
+// DEM: Modelo Digital de Elevação
+var DEM = ee.Image("USGS/SRTMGL1_003");
+// Sentinel-2: para cálculo de NDVI e fator C
+var s2 = ee.ImageCollection("COPERNICUS/S2");
+// MODIS: dados de uso e cobertura do solo
+var modis = ee.ImageCollection("MODIS/006/MCD12Q1");
+
+// 2. DEFINIR ÁREA DE ESTUDO - PROVÍNCIA DE MAPUTO
+// Carregar limites administrativos de Moçambique
+var mozambique = ee.FeatureCollection("projects/eengine-project/assets/gadm41_MOZ_3");
+// Filtrar para a Província de Maputo
+var maputo = mozambique.filter(ee.Filter.eq('NAME_3', 'Marracuene'));
+var aoi = maputo; // Área de interesse definida
+
+// Visualizar a área de estudo
+Map.addLayer(maputo, {color: 'FF0000'}, 'Distrito de Marracuene');
+Map.centerObject(maputo, 9);
+
+// 3. DEFINIR PERÍODO DE ANÁLISE
+var date1 = '2019-01-01'; // Data inicial
+var date2 = '2020-01-01'; // Data final
+
+// 4. CALCULAR FATOR R (EROSIVIDADE DA CHUVA)
+// Somar precipitação no período
+var precipitacao = CHIRPS.filterDate(date1, date2).select('precipitation').sum().clip(aoi);
+// Fórmula para converter precipitação em fator R (adaptada para a região)
+var R = precipitacao.expression(
+  '0.363 * P + 79', {
+    'P': precipitacao.select('precipitation')
+}).rename('R');
+
+Map.addLayer(R, {min: 300, max: 900, palette: ['blue', 'yellow', 'red']}, 'Fator R');
+
+// 5. CALCULAR FATOR K (ERODIBILIDADE DO SOLO)
+// Recortar dados de solo para a área de estudo
+var solo = soil.select('b0').clip(aoi).rename('solo');
+// Classificar valores de textura do solo para obter K
+var K = solo.expression(
+  "(b('solo') > 11) ? 0.0053" +  // Solo muito grosso
+  ": (b('solo') > 10) ? 0.0170" + // Solo grosso
+  ": (b('solo') > 9) ? 0.045" +   // Solo moderadamente grosso
+  ": (b('solo') > 8) ? 0.050" +   // Solo médio
+  ": (b('solo') > 7) ? 0.0499" +  // Solo moderadamente fino
+  ": (b('solo') > 6) ? 0.0394" +  // Solo fino
+  ": (b('solo') > 5) ? 0.0264" +  // Solo muito fino
+  ": 0.0288"                      // Valor padrão
+).rename('K').clip(aoi);
+
+Map.addLayer(K, {min: 0, max: 0.06, palette: ['green', 'yellow', 'brown']}, 'Fator K');
+
+// 6. CALCULAR FATOR LS (COMPRIMENTO E DECLIVIDADE DA ENCOSTA)
+// Calcular declividade a partir do DEM
+var elevacao = DEM.select('elevation');
+var declividade = ee.Terrain.slope(elevacao).clip(aoi);
+// Converter declividade de graus para porcentagem
+var declividade_perc = declividade.divide(180).multiply(Math.PI).tan().multiply(100);
+
+// Calcular fator LS
+var LS_comprimento = Math.sqrt(500/100); // Comprimento padrão de encosta (adaptar conforme necessário)
+var LS_part1 = declividade_perc.multiply(0.53);
+var LS_part2 = declividade_perc.multiply(declividade_perc.multiply(0.076));
+var LS = LS_part1.add(LS_part2).add(0.76).multiply(LS_comprimento).rename("LS");
+
+Map.addLayer(LS, {min: 0, max: 90, palette: ['green', 'yellow', 'red']}, 'Fator LS');
+
+
+// 7. CALCULAR FATOR C (COBERTURA VEGETAL) - VERSÃO FINAL CORRIGIDA
+var s2_filtrado = s2.filterDate(date1, date2).median().clip(aoi);
+var ndvi = s2_filtrado.normalizedDifference(['B8','B4']).rename("NDVI");
+
+// Parâmetros para cálculo do fator C
+var alpha = ee.Number(-2);
+var beta = ee.Number(1);
+
+// Cálculo CORRETO do fator C usando a abordagem de Van der Knijff (2000)
+var C_intermedio = ndvi.multiply(alpha)          // Multiplica NDVI por alpha
+                      .divide(ndvi.multiply(-1).add(1))  // Divide por (1 - NDVI)
+                      .exp();                           // Exponencial do resultado
+
+// Normalização dos valores entre 0 e 1
+var stats = C_intermedio.reduceRegion({
+  reducer: ee.Reducer.minMax(),
+  geometry: aoi,
+  scale: 1000,
+  maxPixels: 1e9
+});
+
+var C_min = ee.Number(stats.get('NDVI_min'));
+var C_max = ee.Number(stats.get('NDVI_max'));
+
+var C = C_intermedio.subtract(C_min)
+                   .divide(C_max.subtract(C_min))
+                   .rename('C_factor');
+
+// Visualização do fator C
+Map.addLayer(C, {
+  min: 0,
+  max: 1,
+  palette: ['darkgreen', 'lightgreen', 'beige']
+}, 'Fator C - Cobertura Vegetal');
+
+
+// 8. CALCULAR FATOR P (PRÁTICAS DE CONSERVAÇÃO)
+// Obter dados de uso do solo
+var uso_solo = modis.filterDate(date1, date2).select('LC_Type1').first().clip(aoi).rename('uso_solo');
+// Combinar com dados de declividade
+var uso_solo_declividade = uso_solo.addBands(declividade_perc);
+
+// Atribuir valores de P conforme uso do solo e declividade
+var P = uso_solo_declividade.expression(
+  "(b('uso_solo') < 11) ? 0.8" +      // Áreas urbanas
+  ": (b('uso_solo') == 11) ? 1" +     // Terras áridas
+  ": (b('uso_solo') == 13) ? 1" +     // Água
+  ": (b('uso_solo') > 14) ? 1" +      // Outros
+  ": (b('slope') < 2) ? 0.6" +        // Terras agrícolas com baixa declividade
+  ": (b('slope') < 5) ? 0.5" +        // Terras agrícolas com média declividade
+  ": (b('slope') < 8) ? 0.5" + 
+  ": (b('slope') < 12) ? 0.6" + 
+  ": (b('slope') < 16) ? 0.7" + 
+  ": (b('slope') < 20) ? 0.8" + 
+  ": 0.9"                             // Terras agrícolas com alta declividade
+).rename('P').clip(aoi);
+
+Map.addLayer(P, {min: 0, max: 1, palette: ['blue', 'green', 'red']}, 'Fator P');
+
+// 9. CALCULAR PERDA DE SOLO ANUAL (RUSLE) - VERSÃO CORRIGIDA
+var perda_solo = R.multiply(K)
+                 .multiply(LS)
+                 .multiply(C)  // Usando a variável C que foi definida na normalização
+                 .multiply(P)
+                 .rename("Perda de Solo");
+
+// Definir estilo para visualização
+var estilo = ['00FF00', 'FFFF00', 'FFA500', 'FF0000', '8B0000'];
+
+// Visualizar perda de solo
+Map.addLayer(perda_solo, {min: 0, max: 40, palette: estilo}, 'Perda de Solo (t/ha/ano)');
+
+
+// 10. CLASSIFICAR PERDA DE SOLO
+var classes_perda = perda_solo.expression(
+  "(b('Perda de Solo') < 5) ? 1" +    // Muito baixa
+  ": (b('Perda de Solo') < 10) ? 2" + // Baixa
+  ": (b('Perda de Solo') < 20) ? 3" + // Moderada
+  ": (b('Perda de Solo') < 40) ? 4" + // Alta
+  ": 5"                               // Muito alta
+).rename('Classes Perda Solo').clip(aoi);
+
+Map.addLayer(classes_perda, {min: 1, max: 5, palette: estilo}, 'Classes de Perda de Solo');
+
+// 11. CALCULAR ÁREA POR CLASSE DE PERDA DE SOLO
+var areaImagem = ee.Image.pixelArea().addBands(classes_perda);
+var areas = areaImagem.reduceRegion({
+  reducer: ee.Reducer.sum().group({
+    groupField: 1,
+    groupName: 'classe',
+  }),
+  geometry: aoi.geometry(),
+  scale: 500,
+  maxPixels: 1e10
+});
+
+// Preparar dados para gráfico
+var lista_areas = ee.List(areas.get('groups'));
+var nomes_classes = ["Muito baixa (<5)", "Baixa (5-10)", "Moderada (10-20)", 
+                    "Alta (20-40)", "Muito alta (>40)"];
+
+// Exibir gráfico de pizza
+print(ui.Chart.array.values(
+  lista_areas.map(function(item) {
+    return ee.Number(ee.Dictionary(item).get('sum')).divide(1e6).round();
+  }), 
+  0, 
+  nomes_classes)
+  .setChartType('PieChart')
+  .setOptions({
+    title: 'Distribuição de Áreas por Classe de Perda de Solo (km²)',
+    slices: [{color: 'green'}, {color: 'yellow'}, {color: 'orange'}, 
+             {color: 'red'}, {color: 'darkred'}]
+  }));
+
+// 12. ADICIONAR LEGENDA
+var legenda = ui.Panel({
+  style: {
+    position: 'bottom-right',
+    padding: '8px 15px'
+  }
+});
+
+// Título da legenda
+var tituloLegenda = ui.Label({
+  value: 'Perda de Solo (t/ha/ano)',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+legenda.add(tituloLegenda);
+
+// Função para criar linhas da legenda
+var criarLinha = function(cor, nome) {
+  var caixaCor = ui.Label({
+    style: {
+      backgroundColor: cor,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+  var descricao = ui.Label({
+    value: nome,
+    style: {margin: '0 0 4px 6px'}
+  });
+  return ui.Panel({
+    widgets: [caixaCor, descricao],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+};
+
+// Adicionar itens à legenda
+for (var i = 0; i < 5; i++) {
+  legenda.add(criarLinha(estilo[i], nomes_classes[i]));
+}
+
+// Adicionar legenda ao mapa
+Map.add(legenda);
+
+
+
+// 13. EXPORTAR RESULTADOS (OPCIONAL)
+// Exportar imagem de perda de solo
+Export.image.toDrive({
+  image: perda_solo,
+  description: 'PerdaSolo_Maputo',
+  folder: 'GEE_Exports',
+  region: aoi.geometry(),
+  scale: 500,
+  maxPixels: 1e10
+});
+
+
+
